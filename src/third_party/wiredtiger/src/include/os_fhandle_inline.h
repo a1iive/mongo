@@ -178,7 +178,7 @@ __wt_write(WT_SESSION_IMPL *session, WT_FH *fh, wt_off_t offset, size_t len, con
     WT_STAT_CONN_INCR(session, write_io);
     WT_STAT_CONN_INCR_ATOMIC(session, thread_write_active);
     time_start = __wt_clock(session);
-
+    DBG_PRINT(LV_LOG, "filename: %s offset: %ul len: %ul", fh->handle->name, offset, len);
     ret = fh->handle->fh_write(fh->handle, (WT_SESSION *)session, offset, len, buf);
 
     time_stop = __wt_clock(session);

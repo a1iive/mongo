@@ -401,6 +401,7 @@ typedef uint64_t wt_timestamp_t;
 #include "schema.h"
 #include "thread_group.h"
 #include "txn.h"
+#include "debug.h"
 
 #include "session.h" /* required by connection.h */
 #include "connection.h"

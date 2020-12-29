@@ -959,6 +959,9 @@ __conn_is_new(WT_CONNECTION *wt_conn)
 static int
 __conn_close(WT_CONNECTION *wt_conn, const char *config)
 {
+#ifdef MYDEBUG
+    if(log_file_fp) DebugDestroy();
+#endif
     WT_CONFIG_ITEM cval;
     WT_CONNECTION_IMPL *conn;
     WT_DECL_RET;
@@ -2340,6 +2343,9 @@ wiredtiger_open(const char *home, WT_EVENT_HANDLER *event_handler, const char *c
     WT_SESSION_IMPL *verify_session;
 #endif
 
+#ifdef MYDEBUG
+    if(log_file_fp != NULL) DebugInit();
+#endif
     /* Leave lots of space for optional additional configuration. */
     const char *cfg[] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 
