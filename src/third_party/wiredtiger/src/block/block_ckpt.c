@@ -886,6 +886,23 @@ __ckpt_update(
     WT_RET(__wt_block_ckpt_to_buffer(session, block, &endp, ci, false));
     ckpt->raw.size = WT_PTRDIFF(endp, ckpt->raw.mem);
 
+    if(is_live) {
+        WT_EXT *ext;
+        WT_EXT_FOREACH (ext, ci->alloc->off) /* Free ranges */
+            DBG_PRINT(LV_LOG, "checkpoint name:%s alloc ext: off=%lld, size=%lld", \
+                ckpt->name, ext->off, ext->size);
+        WT_EXT_FOREACH (ext, ci->discard->off) /* Free ranges */
+            DBG_PRINT(LV_LOG, "checkpoint name:%s discard ext: off=%lld, size=%lld", \
+                ckpt->name, ext->off, ext->size);
+        WT_EXT_FOREACH (ext, ci->avail->off) /* Free ranges */
+            DBG_PRINT(LV_LOG, "checkpoint name:%s avail ext: off=%lld, size=%lld", \
+                ckpt->name, ext->off, ext->size);
+        if(ci->ckpt_avail != NULL) {
+            WT_EXT_FOREACH (ext, ci->ckpt_avail->off) /* Free ranges */
+                DBG_PRINT(LV_LOG, "checkpoint name:%s avail ext: off=%lld, size=%lld", \
+                    ckpt->name, ext->off, ext->size);
+        }
+    }
     if (WT_VERBOSE_ISSET(session, WT_VERB_CHECKPOINT))
         __wt_ckpt_verbose(session, block, "create", ckpt->name, ckpt->raw.data);
 
