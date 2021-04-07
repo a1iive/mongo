@@ -46,6 +46,7 @@
 #include <memory>
 
 #include "mongo/db/storage/wiredtiger/wiredtiger_kv_engine.h"
+#include "mongo/db/storage/wiredtiger/wiredtiger_env.h"
 
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/operations.hpp>
@@ -787,6 +788,510 @@ StatusWith<StorageEngine::BackupInformation> getBackupInformationFromBackupCurso
 
 StringData WiredTigerKVEngine::kTableUriPrefix = "table:"_sd;
 
+/* spdk_file_system begin */
+extern "C"{
+    const size_t wt_gigabyte =  1073741824;
+    const uint32_t wt_stream_sequence = 1;
+    const uint32_t wt_stream_random = 2;
+    const uint32_t wt_stream_no = 0;
+    const uint32_t wt_stream_offset = 1024ul * 1024 * 3.2 * 1024;
+
+    typedef struct {
+        WT_FILE_SYSTEM iface;
+
+        WT_EXTENSION_API *wtext; /* Extension functions */
+
+        pthread_spinlock_t stream_id_lock;
+        uint64_t g_virtual_stream_id;
+    } SPDK_FILE_SYSTEM;
+
+    typedef struct __wt_file_handle_spdk {
+        WT_FILE_HANDLE iface;
+        SPDK_FILE_SYSTEM *spdk_fs;
+
+        void* fd;
+
+        uint64_t stream_id;
+    } WT_FILE_HANDLE_SPDK;
+
+    int spdk_file_system_create(WT_CONNECTION *conn, WT_CONFIG_ARG *config);
+
+    static bool
+    byte_string_match(const char *str, const char *bytes, size_t len)
+    {
+        return (strncmp(str, bytes, len) == 0 && (str)[(len)] == '\0');
+    }
+
+    static int
+    __spdk_fs_exist(
+    WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const char *name, bool *existp)
+    {
+        int ret = 0;
+
+        (void)(file_system);
+        (void)(wt_session);
+
+        ret = spdk_fs_exist(name);
+        if (ret == 0) {
+            *existp = true;
+            return (0);
+        } else {
+            *existp = false;
+            return (0);
+        }
+        // if (ret == ENOENT) {
+        //     *existp = false;
+        //     return (0);
+        // }
+    }
+
+    /*
+    * __wt_spdk_directory_list --
+    *     Get a list of files from a directory, SPDK version.
+    */
+    int
+    __wt_spdk_directory_list(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session,
+    const char *directory, const char *prefix, char ***dirlistp, uint32_t *countp)
+    {
+        (void)(file_system);
+        (void)(wt_session);
+        return (
+            spdk_fs_directory_list(directory, prefix, dirlistp, countp, false));
+    }
+
+    /*
+    * __wt_spdk_directory_list_single --
+    *     Get one file from a directory, SPDK version.
+    */
+    int
+    __wt_spdk_directory_list_single(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session,
+    const char *directory, const char *prefix, char ***dirlistp, uint32_t *countp)
+    {
+        (void)(file_system);
+        (void)(wt_session);
+        return (
+            spdk_fs_directory_list(directory, prefix, dirlistp, countp, true));
+    }
+
+    /*
+    * __wt_spdk_directory_list_free --
+    *     Free memory returned by __wt_spdk_directory_list.
+    */
+    int
+    __wt_spdk_directory_list_free(
+    WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, char **dirlist, uint32_t count)
+    {
+        (void)(file_system);
+        (void)(wt_session);
+        return (
+            spdk_fs_directory_list_free(dirlist, count));
+    }
+
+
+    /*
+    * __spdk_fs_remove --
+    *     Remove a file.
+    */
+    static int
+    __spdk_fs_remove(
+    WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const char *name, uint32_t flags)
+    {
+        int ret = 0;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+
+        spdk_fs = (SPDK_FILE_SYSTEM*)file_system;
+        wtext = spdk_fs->wtext;
+
+        ret = spdk_fs_remove(name);
+        if (ret != 0)
+            {assert(0);}
+
+        return (0);
+    }
+
+    /*
+    * __spdk_fs_rename --
+    *     Rename a file.
+    */
+    static int
+    __spdk_fs_rename(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const char *from,
+    const char *to, uint32_t flags)
+    {
+        int ret = 0;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+
+        spdk_fs = (SPDK_FILE_SYSTEM*)file_system;
+        wtext = spdk_fs->wtext;
+
+        ret = spdk_fs_rename(from, to);
+        if (ret != 0)
+            {assert(0);}
+
+        return (0);
+    }
+
+    /*
+    * __spdk_fs_size --
+    *     Get the size of a file in bytes, by file name.
+    */
+    static int
+    __spdk_fs_size(
+    WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const char *name, wt_off_t *sizep)
+    {
+        int ret = 0;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+    
+        spdk_fs = (SPDK_FILE_SYSTEM*)file_system;
+        wtext = spdk_fs->wtext;
+
+        ret = spdk_fs_size(name, sizep);
+        if (ret == 0) {
+            return (0);
+        }
+        return ret;
+    }
+
+    /*
+    * __spdk_file_close --
+    *     ANSI C close.
+    */
+    static int
+    __spdk_file_close(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session)
+    {
+        int ret = 0;
+        WT_FILE_HANDLE_SPDK *pfh;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+
+        pfh = (WT_FILE_HANDLE_SPDK *)file_handle;
+        spdk_fs = pfh->spdk_fs;
+        wtext = spdk_fs->wtext;
+
+        /* Close the file handle. */
+        if (pfh->fd != NULL) {
+            ret = spdk_close_file((spdk_file_fd **)(&(pfh->fd)));
+            if (ret != 0)
+                {
+                    assert(0);
+                }
+            pfh->fd = NULL;
+        }
+
+        free(file_handle->name);
+        free(pfh);
+        return (ret);
+    }
+
+    /*
+    * __posix_file_lock --
+    *     Lock/unlock a file.
+    */
+    static int
+    __spdk_file_lock(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session, bool lock)
+    {
+        /* Locks are always granted. */
+        (void)file_handle; /* Unused */
+        (void)wt_session;  /* Unused */
+        (void)lock;        /* Unused */
+        return (0);
+    }
+
+    /*
+    * __spdk_file_read --
+    *     POSIX pread.
+    */
+    static int
+    __spdk_file_read(
+    WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session, wt_off_t offset, size_t len, void *buf)
+    {
+        WT_FILE_HANDLE_SPDK *pfh;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+        size_t chunk;
+        int64_t nr;
+        uint8_t *addr;
+
+        pfh = (WT_FILE_HANDLE_SPDK *)file_handle;
+        spdk_fs = pfh->spdk_fs;
+        wtext = spdk_fs->wtext;
+
+
+        /* Break reads larger than 1GB into 1GB chunks. */
+        /*
+        for (addr = (uint8_t*)buf; len > 0; addr += nr, len -= (size_t)nr, offset += nr) {
+            chunk = MIN(len, wt_gigabyte);
+            if ((nr = spdk_read_file((spdk_file_fd*)pfh->fd, offset, chunk, addr)) <= 0)
+                (void)wtext->err_printf(wtext, wt_session, 
+                    "%s: handle-read: pread: failed to read %u bytes at offset %" PRIuMAX,
+                    file_handle->name, chunk, (uintmax_t)offset);
+        }
+        */
+       if ((spdk_read_file((spdk_file_fd*)pfh->fd, offset, len, buf)) <= 0){
+            assert(0);
+       }
+                
+        return (0);
+    }
+
+    /*
+    * __spdk_file_size --
+    *     Get the size of a file in bytes, by file handle.
+    */
+    static int
+    __spdk_file_size(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session, wt_off_t *sizep)
+    {
+        int ret = 0;
+        WT_FILE_HANDLE_SPDK *pfh;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+
+        pfh = (WT_FILE_HANDLE_SPDK *)file_handle;
+        spdk_fs = pfh->spdk_fs;
+        wtext = spdk_fs->wtext;
+
+        ret = spdk_size_file((spdk_file_fd*)pfh->fd, sizep);
+        if (ret == 0) {
+            return (0);
+        }
+        return ret;
+    }
+
+    /*
+    * __spdk_file_sync --
+    *     POSIX fsync.
+    */
+    static int
+    __spdk_file_sync(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session)
+    {
+        int ret = 0;
+        WT_FILE_HANDLE_SPDK *pfh;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+
+        pfh = (WT_FILE_HANDLE_SPDK *)file_handle;
+        spdk_fs = pfh->spdk_fs;
+        wtext = spdk_fs->wtext;
+
+        ret = spdk_sync_file((spdk_file_fd*)pfh->fd);
+        if(ret == 0)
+            return 0;
+            
+        return -1;
+    }
+
+    /*
+    * __spdk_file_truncate --
+    *     POSIX ftruncate.
+    */
+    static int
+    __spdk_file_truncate(WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session, wt_off_t len)
+    {
+        int ret = 0;
+        WT_FILE_HANDLE_SPDK *pfh;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+
+        pfh = (WT_FILE_HANDLE_SPDK *)file_handle;
+        spdk_fs = pfh->spdk_fs;
+        wtext = spdk_fs->wtext;
+
+        ret = spdk_truncate_file((spdk_file_fd*)pfh->fd, len);
+        if(ret == 0)
+            return (0);
+
+        return -1;
+    }
+
+    /*
+    * __spdk_file_write --
+    *     POSIX pwrite.
+    */
+    static int
+    __spdk_file_write(
+    WT_FILE_HANDLE *file_handle, WT_SESSION *wt_session, wt_off_t offset, size_t len, const void *buf/*, uint32_t flags*/)
+    {
+        WT_FILE_HANDLE_SPDK *pfh;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+        size_t chunk;
+        ssize_t nw;
+        const uint8_t *addr;
+        uint64_t stream_id;
+
+        pfh = (WT_FILE_HANDLE_SPDK *)file_handle;
+        spdk_fs = pfh->spdk_fs;
+        wtext = spdk_fs->wtext;
+
+        /*
+        if(flags & wt_stream_sequence) stream_id = 0;
+        else if (flags & wt_stream_random) {
+            stream_id = offset > wt_stream_offset ? 2 : 1;
+        } else {
+            stream_id = pfh->stream_id;
+        }
+        */
+
+        /* Break writes larger than 1GB into 1GB chunks. */
+        // for (addr = (uint8_t*)buf; len > 0; addr += nw, len -= (size_t)nw, offset += nw) {
+        //     chunk = MIN(len, wt_gigabyte);
+        //     if ((nw = spdk_write_file((spdk_file_fd*)pfh->fd, offset, chunk, addr/*, stream_id*/)) < 0)
+        //         (void)wtext->err_printf(wtext, wt_session, 
+        //             "%s: handle-write: pwrite: failed to write %u bytes at offset %" PRIuMAX,
+        //             file_handle->name, chunk, (uintmax_t)offset);
+        // }
+
+        if (spdk_write_file((spdk_file_fd*)pfh->fd, offset, len, const_cast<void *>(buf)/*, stream_id*/) != 0){
+            assert(0);
+        }
+                    
+        return (0);
+    }
+
+    /*
+    * __spdk_open_file --
+    *     Open a file handle.
+    */
+    static int
+    __spdk_open_file(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session, const char *name,
+    WT_FS_OPEN_FILE_TYPE file_type, uint32_t flags, WT_FILE_HANDLE **file_handlep)
+    {
+        int ret = 0;
+        WT_FILE_HANDLE *file_handle;
+        WT_FILE_HANDLE_SPDK *pfh;
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_EXTENSION_API *wtext;
+
+        spdk_fs = (SPDK_FILE_SYSTEM *)file_system;
+        wtext = spdk_fs->wtext;
+        file_handle = NULL;
+        *file_handlep = NULL;
+
+        if((pfh = (WT_FILE_HANDLE_SPDK*)calloc(1, sizeof(WT_FILE_HANDLE_SPDK))) == NULL) {
+            return (ENOMEM);
+        }
+
+        pfh->spdk_fs = spdk_fs;
+
+        // int file_type_ = file_type == WT_FS_OPEN_FILE_TYPE_DIRECTORY ? 0 : 1;
+        ret = spdk_open_file((spdk_file_fd**)(&(pfh->fd)), name, 1);
+        if (ret != 0){
+            goto err;
+        }
+
+        // TODO: retain fd in memory
+        pthread_spin_lock(&spdk_fs->stream_id_lock);
+        pfh->stream_id = spdk_fs->g_virtual_stream_id;
+        ++spdk_fs->g_virtual_stream_id;
+        pthread_spin_unlock(&spdk_fs->stream_id_lock);
+
+        /* Initialize public information. */
+        file_handle = (WT_FILE_HANDLE *)pfh;
+        file_handle->name = strdup(name);
+
+        file_handle->close = __spdk_file_close;
+        file_handle->fh_extend = NULL;
+        file_handle->fh_lock = __spdk_file_lock;
+        file_handle->fh_map = NULL;
+        file_handle->fh_unmap = NULL;
+        file_handle->fh_read = __spdk_file_read;
+        file_handle->fh_size = __spdk_file_size;
+        file_handle->fh_sync = __spdk_file_sync;
+        file_handle->fh_truncate = __spdk_file_truncate;
+        file_handle->fh_write = __spdk_file_write;
+
+        *file_handlep = file_handle;
+
+        return (0);
+
+    err:
+        ret = __spdk_file_close((WT_FILE_HANDLE *)pfh, wt_session);
+        return (ret);
+    }
+
+    /*
+    * __spdk_terminate --
+    *     Terminate a POSIX configuration.
+    */
+    static int
+    __spdk_terminate(WT_FILE_SYSTEM *file_system, WT_SESSION *wt_session)
+    {
+        (void)file_system;
+        (void)wt_session;
+
+        spdk_close_env();
+        
+        free(file_system);
+
+        return (0);
+    }
+
+    // const char *FLAGS_spdk_dir;   //TODO
+    const char *FLAGS_spdk_conf = "/usr/local/etc/spdk/wiredtiger.json";  
+    const char *FLAGS_spdk_bdev = "Nvme0n1";
+    const uint64_t FLAGS_spdk_cache_size = 4096;
+
+    int
+    spdk_file_system_create(WT_CONNECTION *conn, WT_CONFIG_ARG *config)
+    {
+        SPDK_FILE_SYSTEM *spdk_fs;
+        WT_CONFIG_ITEM k, v;
+        WT_CONFIG_PARSER *config_parser;
+        WT_EXTENSION_API *wtext;
+        WT_FILE_SYSTEM *file_system;
+        int ret = 0;
+
+        wtext = conn->get_extension_api(conn);
+
+        if ((spdk_fs = (SPDK_FILE_SYSTEM*)calloc(1, sizeof(SPDK_FILE_SYSTEM))) == NULL) {
+            return (ENOMEM);
+        }
+
+        spdk_init_env(FLAGS_spdk_conf, FLAGS_spdk_bdev, FLAGS_spdk_cache_size);
+
+        pthread_spin_init(&spdk_fs->stream_id_lock, 0);
+        spdk_fs->wtext = wtext;
+        spdk_fs->g_virtual_stream_id = 3;
+
+        file_system = (WT_FILE_SYSTEM *)spdk_fs;
+
+        /*
+        * Applications may have their own configuration information to pass to the underlying
+        * filesystem implementation. See the main function for the setup of those configuration
+        * strings; here we parse configuration information as passed in by main, through WiredTiger.
+        */
+
+        /* Step through our configuration values. */
+        printf("Custom file system configuration\n");
+
+        /* Initialize the in-memory jump table. */
+        file_system->fs_directory_list = __wt_spdk_directory_list;
+        file_system->fs_directory_list_single = __wt_spdk_directory_list_single;
+        file_system->fs_directory_list_free = __wt_spdk_directory_list_free;
+        file_system->fs_exist = __spdk_fs_exist;
+        file_system->fs_open_file = __spdk_open_file;
+        file_system->fs_remove = __spdk_fs_remove;
+        file_system->fs_rename = __spdk_fs_rename;
+        file_system->fs_size = __spdk_fs_size;
+        file_system->terminate = __spdk_terminate;
+
+        if ((ret = conn->set_file_system(conn, file_system, NULL)) != 0) {
+            goto err;
+        }
+        return (0);
+
+    err:
+        spdk_close_env();
+        pthread_spin_destroy(&spdk_fs->stream_id_lock);
+        free(spdk_fs);
+        /* An error installing the file system is fatal. */
+        exit(1);
+    }
+}
+    /* spdk_file_system end */
+    
 WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
                                        const std::string& path,
                                        ClockSource* cs,
@@ -848,6 +1353,10 @@ WiredTigerKVEngine::WiredTigerKVEngine(const std::string& canonicalName,
        << ",close_scan_interval=" << gWiredTigerFileHandleCloseScanInterval
        << ",close_handle_minimum=" << gWiredTigerFileHandleCloseMinimum << "),";
     ss << "statistics_log=(wait=" << wiredTigerGlobalOptions.statisticsLogDelaySecs << "),";
+    ss << "extensions=(local={"
+            "entry=spdk_file_system_create,early_load=true,"
+            "config={config_string=\"spdk-file-system\",config_value=37}"
+            "}),";
 
     if (shouldLog(::mongo::logv2::LogComponent::kStorageRecovery, logv2::LogSeverity::Debug(3))) {
         ss << "verbose=[recovery_progress,checkpoint_progress,compact_progress,recovery],";

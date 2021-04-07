@@ -4284,6 +4284,19 @@ if get_option('install-mode') == 'hygienic':
                 "-Wl,-h,${TARGET.file}",
             ]
         )
+        env.Append(
+            LIBPATH=[
+                '/home/denghejian/dir/spdk/build/lib',
+                '/home/denghejian/dir/spdk/dpdk/build/lib',
+                '/home/denghejian/dir/spdk/isa-l/.libs',
+            ],
+            LINKFLAGS= [
+            '-Wl,--whole-archive','-Wl,--no-as-needed','-lspdk_bdev_malloc','-lspdk_bdev_null','-lspdk_bdev_nvme','-lspdk_bdev_passthru','-lspdk_bdev_lvol','-lspdk_bdev_raid','-lspdk_bdev_error','-lspdk_bdev_gpt','-lspdk_bdev_split','-lspdk_bdev_delay','-lspdk_bdev_zone_block','-lspdk_blobfs_bdev','-lspdk_blobfs','-lspdk_blob_bdev','-lspdk_lvol','-lspdk_blob','-lspdk_nvme','-lspdk_bdev_ftl','-lspdk_ftl','-lspdk_bdev_aio','-lspdk_bdev_virtio','-lspdk_virtio','-lspdk_accel_ioat','-lspdk_ioat','-lspdk_sock_posix','-lspdk_event_bdev','-lspdk_bdev','-lspdk_notify','-lspdk_event_accel','-lspdk_accel','-lspdk_event_vmd','-lspdk_vmd','-lspdk_event_sock','-lspdk_event','-lspdk_thread','-lspdk_trace','-lspdk_sock','-lspdk_rpc','-lspdk_jsonrpc','-lspdk_json','-lspdk_util','-lspdk_log','-Wl,--no-whole-archive',
+            '/home/denghejian/dir/spdk/build/lib/libspdk_env_dpdk.a',
+            '-Wl,--whole-archive','/home/denghejian/dir/spdk/dpdk/build/lib/librte_eal.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_mempool.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_ring.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_mbuf.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_pci.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_bus_pci.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_mempool_ring.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_power.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_telemetry.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_kvargs.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_vhost.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_net.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_cryptodev.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_hash.a','/home/denghejian/dir/spdk/dpdk/build/lib/librte_rcu.a','-Wl,--no-whole-archive',
+            '-lnuma','-lisal','-lrt','-luuid','-lcrypto','-laio',
+            ],
+        )
     elif env['PLATFORM'] == 'darwin':
         env.AppendUnique(
             LINKFLAGS=[
